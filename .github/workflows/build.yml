@@ -1,0 +1,43 @@
+# Builds every package on pushes and pull requests to main and pushes it to
+# the lbssousa-noctalia Cachix (manual changes to this flake). The daily
+# update commits its own lock with the GITHUB_TOKEN, which does not trigger
+# this workflow: it has already built and cached everything.
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+
+      - uses: actions/checkout@v6
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            accept-flake-config = true
+
+      - uses: cachix/cachix-action@v16
+        with:
+          name: lbssousa-noctalia
+          # Empty on pull requests from forks: builds without pushing.
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Formatting
+        run: nix fmt -- --ci
+
+      - run: nix build .#all -L --no-link
+
+      - run: nix flake check -L

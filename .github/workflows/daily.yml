@@ -1,0 +1,131 @@
+# Daily: rebase the forks' nix-config branches onto the newest upstream base,
+# update flake.lock, build everything, push it to the lbssousa-noctalia
+# Cachix and, only if all of that succeeds, commit the new lock and tell
+# nix-config-noctalia. A failure leaves the previous lock in place and opens
+# an issue.
+name: daily
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: daily
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync-forks:
+    name: Sync ${{ matrix.fork }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fork: lbssousa/noctalia
+            upstream: noctalia-dev/noctalia
+            mode: tag
+          - fork: lbssousa/noctalia-greeter
+            upstream: noctalia-dev/noctalia-greeter
+            mode: tag
+          - fork: lbssousa/umbriel
+            upstream: noctalia-dev/umbriel
+            mode: main
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Rebase nix-config onto the newest upstream base
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.FORKS_TOKEN }}
+          SYNC_REPORT: ${{ runner.temp }}/report.md
+        run: |
+          set +e
+          bash scripts/sync-fork.sh "${{ matrix.fork }}" "${{ matrix.upstream }}" "${{ matrix.mode }}"
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          [[ -f $SYNC_REPORT ]] && cat "$SYNC_REPORT" >> "$GITHUB_STEP_SUMMARY"
+          # A conflict (2) is reported as an issue; the update job still runs
+          # with the previous fork state.
+          [[ $status == 0 || $status == 2 ]]
+
+      - name: Open or update the conflict issue
+        if: steps.sync.outputs.status == '2'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SYNC_REPORT: ${{ runner.temp }}/report.md
+        run: |
+          title="Rebase de ${{ matrix.fork }} (nix-config) falhou"
+          number=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
+          if [[ -n $number ]]; then
+            gh issue comment "$number" --body-file "$SYNC_REPORT"
+          else
+            gh issue create --title "$title" --body-file "$SYNC_REPORT"
+          fi
+
+  update:
+    name: Update, build and cache
+    needs: sync-forks
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+
+      - uses: actions/checkout@v6
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            accept-flake-config = true
+
+      - uses: cachix/cachix-action@v16
+        with:
+          name: lbssousa-noctalia
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Update flake.lock
+        run: nix flake update
+
+      - name: Build every package (pushed to Cachix as it goes)
+        run: nix build .#all -L --no-link
+
+      - name: Flake checks
+        run: nix flake check -L
+
+      - name: Commit the lock and notify nix-config-noctalia
+        env:
+          GH_TOKEN: ${{ secrets.FORKS_TOKEN }}
+        run: |
+          if git diff --quiet flake.lock; then
+            echo "flake.lock unchanged" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "flake: update flake.lock (built and cached)" flake.lock
+          git push origin HEAD:main
+          gh api repos/lbssousa/nix-config-noctalia/dispatches \
+            -f event_type=noctalia-nix-updated \
+            -f "client_payload[rev]=$(git rev-parse HEAD)"
+          echo "flake.lock updated to $(git rev-parse --short HEAD); nix-config-noctalia notified" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or update the failure issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Atualização diária falhou"
+          body="A execução ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} falhou; o flake.lock anterior continua valendo."
+          number=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
+          if [[ -n $number ]]; then
+            gh issue comment "$number" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
